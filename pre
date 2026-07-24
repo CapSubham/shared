@@ -1,0 +1,241 @@
+#!/bin/bash
+# ==============================================================================
+# Unified SAP Pre-Check Capture, Ordered Landscape Shutdown & Kernel Backup
+# Developed and maintained by Subham Dubey
+# ==============================================================================
+
+set -o pipefail
+
+INPUT_SID="$1"
+if [[ -z "$INPUT_SID" ]]; then
+    read -r -p "Enter target 3-character SAP SID: " INPUT_SID
+fi
+
+SID=$(echo "${INPUT_SID}" | tr '[:lower:]' '[:upper:]')
+SID_LOWER=$(echo "${SID}" | tr '[:upper:]' '[:lower:]')
+CURRENT_USER=$(whoami)
+EXPECTED_USER="${SID_LOWER}adm"
+
+if [[ "$CURRENT_USER" != "$EXPECTED_USER" ]]; then
+    echo "ERROR: User mismatch! SID '${SID}' requires user '${EXPECTED_USER}'. Current user: '${CURRENT_USER}'."
+    exit 1
+fi
+
+LOCAL_HOST=$(hostname -s | tr '[:upper:]' '[:lower:]')
+LOG_DIR="/usr/sap/maintenance_checks/${SID}"
+KERNEL_DIR="/usr/sap/${SID}/SYS/exe/run"
+TIMESTAMP=$(date +"%Y-%m-%d %H:%M:%S")
+
+mkdir -p "$LOG_DIR"
+
+# Locate local bootstrap instance
+BASE_SYSNR=$(ls -1 "/usr/sap/${SID}/" 2>/dev/null | grep -E "^(D|ASCS|J|SCS|W|G|DVEBMGS)[0-9]{2}$" | head -n 1 | grep -oE "[0-9]{2}$")
+
+if [[ -z "$BASE_SYSNR" ]]; then
+    echo "ERROR: No local SAP instances found under /usr/sap/${SID}/ to bootstrap discovery."
+    exit 1
+fi
+
+# ==============================================================================
+# PHASE 1: N and N-1 Log Capture
+# ==============================================================================
+
+rotate_and_write() {
+    local target_file="$1"
+    local curr_file="${target_file}.curr"
+    local last_file="${target_file}.last"
+    local temp_input="${target_file}.tmp"
+
+    cat - > "$temp_input"
+
+    if [[ -f "$curr_file" ]]; then
+        mv "$curr_file" "$last_file"
+    fi
+
+    echo "====================================================================" > "$curr_file"
+    echo " [RUN N - CURRENT] Captured at: ${TIMESTAMP} on ${LOCAL_HOST}" >> "$curr_file"
+    echo "====================================================================" >> "$curr_file"
+    cat "$temp_input" >> "$curr_file"
+    echo "" >> "$curr_file"
+
+    cat "$curr_file" > "$target_file"
+    if [[ -f "$last_file" ]]; then
+        echo "====================================================================" >> "$target_file"
+        echo " [RUN N-1 - PREVIOUS]" >> "$target_file"
+        echo "====================================================================" >> "$target_file"
+        cat "$last_file" >> "$target_file"
+    fi
+
+    rm -f "$temp_input"
+}
+
+echo "--> Capturing local pre-check state to ${LOG_DIR}..."
+
+{
+    echo "--- Specific SAP Mount Points ---"
+    df -h | grep -E "(Filesystem|/sap|/usr/sap|/hana|/oracle|/sybase|/db2)" || true
+    echo -e "\n--- Full df -h Output ---"
+    df -h
+} | rotate_and_write "${LOG_DIR}/fs.txt"
+
+{
+    ps -ef | grep -E "(dw.sap|ms.sap|enq.sap|disp\+work|sapstartsrv|hdbindexserver|hdbnameserver|ora_${SID}|syb|db2)" | grep -v grep || echo "No active SAP/DB processes found."
+} | rotate_and_write "${LOG_DIR}/sap_db_process.txt"
+
+{
+    ps -ef | grep -v -E "(dw.sap|ms.sap|enq.sap|disp\+work|sapstartsrv|hdbindexserver|hdbnameserver|ora_${SID}|syb|db2|grep)"
+} | rotate_and_write "${LOG_DIR}/other_process.txt"
+
+{
+    disp+work || echo "ERROR: Could not execute disp+work in current path."
+} | rotate_and_write "${LOG_DIR}/package_info.txt"
+
+echo "Pre-check logs captured successfully."
+
+# ==============================================================================
+# PHASE 2: Landscape Discovery & Classification
+# ==============================================================================
+
+echo -e "\n===================================================================="
+echo " LANDSCAPE DISCOVERY (Bootstrapped via Local Instance ${BASE_SYSNR})"
+echo "===================================================================="
+
+AI_INSTANCES=()
+CI_INSTANCES=()
+CS_INSTANCES=()
+
+# Extract ONLY true CSV data rows where the second column is a number
+RAW_LIST=$(sapcontrol -nr "${BASE_SYSNR}" -function GetSystemInstanceList | awk -F',' '$2 ~ /^[ \t]*[0-9]+[ \t]*$/')
+
+if [[ -z "$RAW_LIST" ]]; then
+    echo "ERROR: GetSystemInstanceList returned no valid instance rows."
+    exit 1
+fi
+
+printf "%-15s %-10s %-25s %-15s\n" "HOSTNAME" "INST_NR" "TYPE" "STATUS"
+echo "--------------------------------------------------------------------"
+
+while IFS=',' read -r host inst_nr http https priority features status; do
+    host=$(echo "$host" | xargs | tr '[:upper:]' '[:lower:]')
+    inst_nr=$(echo "$inst_nr" | xargs)
+    features=$(echo "$features" | xargs)
+    status=$(echo "$status" | xargs)
+    priority=$(echo "$priority" | xargs)
+
+    # Force strict 2-digit zero padding (e.g., 0 -> 00, 1 -> 01)
+    inst_nr=$(printf "%02d" "$((10#$inst_nr))")
+
+    if [[ "$features" =~ MESSAGESERVER ]]; then
+        type="CS/ASCS"
+        CS_INSTANCES+=("${inst_nr}|${host}|${type}")
+    else
+        # Check against zero-padded directory names or startup priority
+        if [[ -d "/usr/sap/${SID}/DVEBMGS${inst_nr}" ]] || [[ -d "/usr/sap/${SID}/D${inst_nr}" && "$priority" == "1" ]] || [[ "$priority" == "1" && ! "$features" =~ MESSAGESERVER ]]; then
+            type="CI/PAS"
+            CI_INSTANCES+=("${inst_nr}|${host}|${type}")
+        else
+            type="AI/AAS"
+            AI_INSTANCES+=("${inst_nr}|${host}|${type}")
+        fi
+    fi
+
+    printf "%-15s %-10s %-25s %-15s\n" "$host" "$inst_nr" "$type" "$status"
+done <<< "$RAW_LIST"
+
+echo "===================================================================="
+echo "WARNING: System ${SID} shutdown sequence initiating in 5 seconds."
+echo "Order: Additional Instances -> Central Instance -> Central Services"
+echo "Press Ctrl+C immediately to ABORT."
+sleep 5
+
+stop_instance() {
+    local inst_nr="$1"
+    local target_host="$2"
+    local label="$3"
+
+    echo -e "\n--> Stopping ${label} (Instance ${inst_nr} on host ${target_host})..."
+    
+    sapcontrol -host "${target_host}" -nr "${inst_nr}" -function Stop
+
+    local timeout=300
+    local elapsed=0
+    while true; do
+        local proc_list=$(sapcontrol -host "${target_host}" -nr "${inst_nr}" -function GetProcessList 2>/dev/null | grep -E "(GREEN|YELLOW)" || true)
+        if [[ -z "$proc_list" ]]; then
+            echo "    [SUCCESS] Instance ${inst_nr} stopped completely."
+            break
+        fi
+
+        if (( elapsed >= timeout )); then
+            echo "    [ERROR] Timeout waiting for Instance ${inst_nr} on ${target_host} to stop!"
+            exit 1
+        fi
+        sleep 5
+        (( elapsed += 5 ))
+    done
+
+    if [[ "$target_host" == "$LOCAL_HOST" ]]; then
+        echo "    Executing local cleanipc for Instance ${inst_nr}..."
+        cleanipc "${inst_nr}" remove
+    else
+        echo "    [SKIP] cleanipc skipped for Instance ${inst_nr} (remote host: ${target_host}). Must execute locally."
+    fi
+}
+
+# ==============================================================================
+# PHASE 3: Ordered Shutdown Sequence
+# ==============================================================================
+
+if [ ${#AI_INSTANCES[@]} -eq 0 ]; then
+    echo -e "\n--> Phase 1: No additional instances (AI) found in landscape."
+else
+    echo -e "\n--> Phase 1: Stopping Additional Instances (AI)..."
+    for entry in "${AI_INSTANCES[@]}"; do
+        IFS='|' read -r nr host type <<< "$entry"
+        stop_instance "$nr" "$host" "$type"
+    done
+fi
+
+if [ ${#CI_INSTANCES[@]} -eq 0 ]; then
+    echo -e "\n--> Phase 2: No Primary/Central instance identified."
+else
+    echo -e "\n--> Phase 2: Stopping Primary/Central Instance (CI)..."
+    for entry in "${CI_INSTANCES[@]}"; do
+        IFS='|' read -r nr host type <<< "$entry"
+        stop_instance "$nr" "$host" "$type"
+    done
+fi
+
+if [ ${#CS_INSTANCES[@]} -eq 0 ]; then
+    echo -e "\n--> Phase 3: No Central Services (CS) found."
+else
+    echo -e "\n--> Phase 3: Stopping Central Services (CS)..."
+    for entry in "${CS_INSTANCES[@]}"; do
+        IFS='|' read -r nr host type <<< "$entry"
+        stop_instance "$nr" "$host" "$type"
+    done
+fi
+
+# ==============================================================================
+# PHASE 4: Local Kernel Backup & N/N-1 Retention Enforcement
+# ==============================================================================
+
+echo -e "\n--> Phase 4: Backing up local kernel directory..."
+
+BACKUP_FILE="${LOG_DIR}/kernel_backup_${SID}_$(date +"%Y%m%d_%H%M%S").tar.gz"
+
+if [[ -d "$KERNEL_DIR" ]]; then
+    echo "Archiving ${KERNEL_DIR} to ${BACKUP_FILE}..."
+    tar -czf "$BACKUP_FILE" -C "${KERNEL_DIR}" .
+    echo "SUCCESS: Archive created -> ${BACKUP_FILE}"
+    
+    # Prune kernel backups to strictly keep N and N-1 (newest 2 files)
+    echo "Enforcing N and N-1 retention policy on kernel archives..."
+    cd "$LOG_DIR" || exit 1
+    ls -t kernel_backup_${SID}_*.tar.gz 2>/dev/null | tail -n +3 | xargs -r rm -f
+    echo "SUCCESS: Old archives purged. Current retained archives:"
+    ls -lh kernel_backup_${SID}_*.tar.gz
+else
+    echo "ERROR: Local kernel path ${KERNEL_DIR} not found for backup!"
+    exit 1
+fi
